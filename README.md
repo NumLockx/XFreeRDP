@@ -141,12 +141,14 @@ This repository includes a build script that packages the app as a single `.AppI
 - `python3-tk` on the **build** machine (the bundler needs to find tkinter)
 
 Example:
+```bash
 wget https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage \
      -O ~/.local/bin/appimagetool
 chmod +x ~/.local/bin/appimagetool
 
 nano ~/.bashrc
 export PATH="$HOME/.local/bin:$PATH"
+```
 
 ---
 
