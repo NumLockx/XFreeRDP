@@ -5,7 +5,7 @@ XFreeRDP GUI - A graphical frontend for FreeRDP on Linux
 from __future__ import annotations
 
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox, filedialog, simpledialog
 from tkinter import font as tkfont
 from types import ModuleType
 from typing import Any
@@ -13,6 +13,10 @@ import subprocess
 import json
 import os
 import shutil
+import sys
+import queue
+import tempfile
+import time
 from pathlib import Path
 
 sv_ttk: ModuleType | None
@@ -24,6 +28,14 @@ try:
 except ImportError:
     sv_ttk = None
 
+from tray import TrayIcon, TRAY_AVAILABLE
+from dialogs import Tooltip, DriveDialog, UnlockDialog, PasswordDialog
+
+
+def _resource_path(name: str) -> Path:
+    """Path to a bundled data file, working both from source and frozen."""
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+    return Path(base) / name
 
 def _detect_system_dark() -> bool:
     """Return True if the desktop colour-scheme is set to dark."""
@@ -46,122 +58,63 @@ def _detect_system_dark() -> bool:
     return False
 
 
-CONFIG_DIR = Path.home() / ".config" / "xfreerdp-gui"
-PROFILES_FILE = CONFIG_DIR / "profiles.json"
-SETTINGS_FILE = CONFIG_DIR / "settings.json"
-
-
-def ensure_config_dir():
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Tooltip helper
-# ─────────────────────────────────────────────────────────────────────────────
-class Tooltip:
-    """Simple hover tooltip for any tkinter widget."""
-
-    def __init__(self, widget: tk.Widget, text: str):
-        self._widget = widget
-        self._text = text
-        self._tip_window = None
-        widget.bind("<Enter>", self._show)
-        widget.bind("<Leave>", self._hide)
-
-    def _show(self, _event: tk.Event[Any] | None = None) -> None:
-        if self._tip_window or not self._text:
-            return
-        x = self._widget.winfo_rootx() + 20
-        y = self._widget.winfo_rooty() + self._widget.winfo_height() + 4
-        self._tip_window = tw = tk.Toplevel(self._widget)
-        tw.wm_overrideredirect(True)
-        tw.wm_geometry(f"+{x}+{y}")
-        tk.Label(
-            tw,
-            text=self._text,
-            background="#ffffe0",
-            foreground="#1a1a1a",
-            relief=tk.SOLID,
-            borderwidth=1,
-            font=("", 8),
-            padx=6,
-            pady=3,
-            wraplength=300,
-            justify=tk.LEFT,
-        ).pack()
-
-    def _hide(self, _event: tk.Event[Any] | None = None) -> None:
-        if self._tip_window:
-            self._tip_window.destroy()
-            self._tip_window = None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Drive-redirection dialog
-# ─────────────────────────────────────────────────────────────────────────────
-class DriveDialog(tk.Toplevel):
-    def __init__(self, parent: XFreeRDPApp):
-        super().__init__(parent)
-        self.resizable(False, False)
-        self.result = None
-        self.transient(parent)
-        self.grab_set()
-
-        f = ttk.Frame(self, padding=parent._scaled(15))  # type: ignore[reportPrivateUsage]
-        f.pack(fill=tk.BOTH, expand=True)
-
-        ttk.Label(f, text="Share name:").grid(row=0, column=0, sticky=tk.W, pady=4)
-        self.name_var = tk.StringVar(value="share")
-        ttk.Entry(f, textvariable=self.name_var, width=22).grid(
-            row=0, column=1, sticky=tk.EW, padx=(10, 0), pady=4
-        )
-
-        ttk.Label(f, text="Local path:").grid(row=1, column=0, sticky=tk.W, pady=4)
-        self.path_var = tk.StringVar()
-        path_row = ttk.Frame(f)
-        path_row.grid(row=1, column=1, sticky=tk.EW, padx=(10, 0), pady=4)
-        ttk.Entry(path_row, textvariable=self.path_var, width=22).pack(
-            side=tk.LEFT, fill=tk.X, expand=True
-        )
-        ttk.Button(
-            path_row,
-            text="…",
-            width=3,
-            command=lambda: self.path_var.set(
-                filedialog.askdirectory(title="Select folder") or self.path_var.get()
-            ),
-        ).pack(side=tk.LEFT, padx=(3, 0))
-
-        btn = ttk.Frame(f)
-        btn.grid(row=2, column=0, columnspan=2, pady=(12, 0))
-        ttk.Button(btn, text="OK", command=self._ok).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn, text="Cancel", command=self.destroy).pack(side=tk.LEFT, padx=5)
-
-        f.columnconfigure(1, weight=1)
-        self.bind("<Return>", lambda _: self._ok())
-        self.bind("<Escape>", lambda _: self.destroy())
-
-    def _ok(self):
-        name = self.name_var.get().strip()
-        path = self.path_var.get().strip()
-        if name and path:
-            self.result = f"{name},{path}"
-        self.destroy()
+from common import (
+    ensure_config_dir, has_legacy_profiles,
+    validate_int, validate_port, mask_argv,
+)
+from dialogs import Tooltip, DriveDialog, UnlockDialog
+from storage import ProfileVault, SettingsStore, UNLOCKED, WRONG_PASS
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Main application
 # ─────────────────────────────────────────────────────────────────────────────
 class XFreeRDPApp(tk.Tk):
+    _ERROR_HINTS: list[tuple[str, str]] = [
+        ("ERRCONNECT_LOGON_FAILURE",
+         "Logon failed — wrong username or password."),
+        ("ERRCONNECT_AUTHENTICATION_FAILED",
+         "Authentication failed — wrong username or password."),
+        ("ERRCONNECT_PASSWORD_EXPIRED",
+         "Your password has expired on the server."),
+        ("ERRCONNECT_ACCOUNT_DISABLED",
+         "The account is disabled on the server."),
+        ("ERRCONNECT_CONNECT_REFUSED",
+         "Connection refused — nothing is listening on that port."),
+        ("ERRCONNECT_CONNECT_TIMEOUT",
+         "Connection timed out."),
+        ("ERRCONNECT_HOSTNAME_NOT_FOUND",
+         "Host not found — check the address."),
+        ("ERRCONNECT_SECURITY_NEGOTIATION_FAILED",
+         "Security negotiation failed — protocol mismatch."),
+        ("ERRCONNECT_SSL_ERR",
+         "TLS problem — certificate or protocol mismatch."),
+        ("ERRCONNECT_CONNECT_TRANSPORT_FAILED",
+         "Could not establish a connection to the server."),
+    ]
+
     def __init__(self):
         super().__init__()
         self.title("XFreeRDP GUI")
-        self._init_display_scaling()
-        self._apply_global_font_scaling()
+
+        # Withdraw immediately when tray mode will be used, so the window
+        # is never mapped even briefly. Geometry/theme calls all work fine
+        # on a withdrawn window.
+        if TRAY_AVAILABLE:
+            self.withdraw()
 
         ensure_config_dir()
-        self.profiles = self._load_profiles()
+        self.settings = SettingsStore()
+        self._vault = ProfileVault()
+        self._tray = None
+        self._tray_queue: queue.Queue = queue.Queue()
+        self._child_log = Path(tempfile.gettempdir()) / "xfreerdp-last-output.log"
+        self._launch_t0 = time.monotonic()
+        self.profiles: dict[str, Any] = {}
         self._dark_mode = self._load_theme_setting()
+
+        self._init_display_scaling()
+        self._apply_global_font_scaling()
 
         self._apply_theme()
         self._set_window_icon()
@@ -169,9 +122,33 @@ class XFreeRDPApp(tk.Tk):
         self._refresh_command_preview()
         self._set_initial_window_size()
 
+        # ── Tray support check ──────────────────────────────────────────
+        if TRAY_AVAILABLE:
+            problem = self._check_tray_support()
+            if problem is not None:
+                messagebox.showwarning("System tray unavailable", problem)
+                self.destroy()
+                sys.exit(1)   # per design: exit after the popup is closed
+            self._setup_tray()
+            self._set_status("Running in tray — vault locked.")
+        else:
+            self.after(100, self._startup_with_tray_warning)
+
         # Global keyboard shortcuts
         self.bind("<Control-Return>", lambda _: self._connect())
         self.bind("<Control-s>",      lambda _: self._save_profile())
+        self.after(1000, self._tick_lock)
+
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        if TRAY_AVAILABLE:
+            self.after(100, self._poll_tray_queue)
+
+    def _humanize_error(self, tail: str) -> str:
+        for line in reversed(tail.splitlines()):
+            for needle, hint in self._ERROR_HINTS:
+                if needle in line:
+                    return hint
+        return ""
 
     def _init_display_scaling(self):
         """Capture Tk scaling and expose a helper for scaled UI metrics."""
@@ -194,6 +171,83 @@ class XFreeRDPApp(tk.Tk):
             except Exception:
                 pass
 
+    def _startup_vault_flow(self):
+        """On launch: unlock existing vault, or offer to migrate legacy plaintext profiles."""
+        if self._vault.exists:
+            self._prompt_unlock()
+        elif has_legacy_profiles():
+            if messagebox.askyesno(
+                "Migrate Profiles",
+                "Plaintext profiles were found (old profiles.json).\n\n"
+                "Create an encrypted vault and import them?\n"
+                "The old plaintext file will be renamed after import.",
+            ):
+                if self._prompt_unlock(creating=True):
+                    legacy = self._vault.load_legacy_profiles()
+                    self._vault.profiles.update(legacy)
+                    if self._vault.save():
+                        self._vault.retire_legacy_file()
+                        self.profiles = dict(self._vault.profiles)
+                        self._refresh_profile_list()
+                        self._set_status(f"Imported {len(legacy)} profile(s) into the vault.")
+
+    def _prompt_unlock(self, creating: bool = False) -> bool:
+        """Show the unlock popup. Returns True if the vault is now unlocked."""
+        for _attempt in range(3):
+            dlg = UnlockDialog(self, creating=creating)
+            self.wait_window(dlg)
+            if dlg.result is None:
+                return False
+            passphrase, ttl = dlg.result
+            status = self._vault.unlock(passphrase, ttl)
+            if status == WRONG_PASS:
+                messagebox.showerror("Vault Locked", "Incorrect passphrase.")
+                continue
+            if status != UNLOCKED:  # storage.ERROR
+                messagebox.showerror("Vault Error",
+                    "The vault could not be read; it may be corrupted.")
+                return False
+            self.profiles = dict(self._vault.profiles)
+            self._refresh_profile_list()
+            self._lock_btn.config(
+                text=f"🔒 Lock ({self._fmt_secs(self._vault.seconds_left)})"
+            )
+            self._set_status("Vault unlocked.")
+            self._tray_refresh_menu()
+            return True
+        return False
+
+    def _toggle_lock(self):
+        if self._vault.unlocked:
+            if not self._vault.save():
+                messagebox.showwarning("Vault", "Could not flush changes before locking.")
+            self._vault.lock()
+            self.profiles = {}
+            self._refresh_profile_list()
+            self._lock_btn.config(text="🔓 Unlock vault")
+            self._set_status("Vault locked — decrypted profiles cleared from memory.")
+            self._tray_refresh_menu()
+        else:
+            self._prompt_unlock()
+            self._tray_refresh_menu()
+
+    def _tick_lock(self):
+        """Once per second: update countdown, auto-clear on expiry."""
+        was = getattr(self, "_vault_open_prev", False)
+        now = self._vault.unlocked
+        if now:
+            self._lock_btn.config(
+                text=f"🔒 Lock ({self._fmt_secs(self._vault.seconds_left)})"
+            )
+        elif was:  # TTL just expired
+            self.profiles = {}
+            self._refresh_profile_list()
+            self._lock_btn.config(text="🔓 Unlock vault")
+            self._set_status("Vault lock expired — profiles cleared from memory.")
+            self._tray_refresh_menu()
+        self._vault_open_prev = now
+        self.after(1000, self._tick_lock)
+
     def _read_ui_scale_override(self) -> float:
         """Optional explicit override from env or settings.json (ui_scale)."""
         raw_env = os.environ.get("XFREERDP_GUI_SCALE", "").strip()
@@ -205,7 +259,7 @@ class XFreeRDPApp(tk.Tk):
             if env_scale > 0:
                 return env_scale
 
-        cfg = self._load_settings()
+        cfg = self.settings.data
         raw_cfg = cfg.get("ui_scale")
         if raw_cfg is None:
             return 0.0
@@ -225,6 +279,18 @@ class XFreeRDPApp(tk.Tk):
             except ValueError:
                 continue
         return None
+
+    @staticmethod
+    def _fmt_secs(secs: int) -> str:
+        secs = max(0, secs)
+        d, rem = divmod(secs, 86_400)
+        h, rem = divmod(rem, 3_600)
+        m, _ = divmod(rem, 60)
+        if d:
+            return f"{d}d {h}h"
+        if h:
+            return f"{h}h {m}m"
+        return f"{m}m"
 
     def _gsettings_number(self, schema: str, key: str) -> float | None:
         try:
@@ -339,14 +405,19 @@ class XFreeRDPApp(tk.Tk):
 
         win_w = min(req_w, int(screen_w * 0.96))
         win_h = min(req_h, int(screen_h * 0.92))
+        # Explicit position: without +x+y the WM is free to place the window
+        # wherever its policy says — producing the flash-then-relocate seen
+        # on KWin. Requesting the position makes it stick.
+        x = max(0, (screen_w - win_w) // 2)
+        y = max(0, (screen_h - win_h) // 2)
 
-        self.geometry(f"{win_w}x{win_h}")
+        self.geometry(f"{win_w}x{win_h}+{x}+{y}")
         self.minsize(self._scaled(500), self._scaled(400))
 
     # ── Window icon ─────────────────────────────────────────────────────
     def _set_window_icon(self):
-        src = Path(__file__).parent / "icon.svg"
-        dst = Path(__file__).parent / "icon.png"
+        src = _resource_path("icon.svg")
+        dst = _resource_path("icon.png")
         if not dst.exists() and src.exists():
             for cmd in (
                 ["rsvg-convert", "-w", "64", "-h", "64", "-o", str(dst), str(src)],
@@ -415,34 +486,60 @@ class XFreeRDPApp(tk.Tk):
             bg, fg   = "#2b2b2b", "#e0e0e0"
             ebg, efg = "#3c3c3c", "#e0e0e0"
             selbg    = "#0062cc"
-            trough   = "#404040"
-            self.configure(bg=bg)
-            style.theme_use("clam")
-            style.configure(".",                  background=bg, foreground=fg, fieldbackground=ebg)
-            style.configure("TFrame",             background=bg)
-            style.configure("TLabel",             background=bg, foreground=fg)
-            style.configure("TLabelframe",        background=bg, foreground=fg)
-            style.configure("TLabelframe.Label",  background=bg, foreground=fg)
-            style.configure("TNotebook",          background=bg)
-            style.configure("TNotebook.Tab",      background=bg, foreground=fg)
-            style.map("TNotebook.Tab",            background=[("selected", selbg)],
-                                                  foreground=[("selected", "#ffffff")])
-            style.configure("TEntry",             fieldbackground=ebg, foreground=efg, insertcolor=fg)
-            style.configure("TCombobox",          fieldbackground=ebg, foreground=efg,
-                                                  selectbackground=selbg)
-            style.configure("TButton",            background="#4a4a4a", foreground=fg)
-            style.map("TButton",                  background=[("active", "#5a5a5a")])
-            style.configure("TCheckbutton",       background=bg, foreground=fg)
-            style.configure("TScrollbar",         background=bg, troughcolor=trough)
-            style.configure(
-                "Shortcut.TLabel",
-                background=bg,
-                foreground=fg,
-                font=("", self._scaled(9), "bold"),
-            )
+            btnbg, btnbg_active, trough = "#4a4a4a", "#5a5a5a", "#404040"
         else:
-            style.theme_use("clam")
-            style.configure("Shortcut.TLabel", font=("", self._scaled(9), "bold"))
+            bg, fg   = "#f0f0f0", "#1a1a1a"
+            ebg, efg = "#ffffff", "#1a1a1a"
+            selbg    = "#0078d4"
+            btnbg, btnbg_active, trough = "#e1e1e1", "#d5d5d5", "#dcdcdc"
+
+        # Theme choice persists across switches, so both branches must set
+        # every style fully — nothing may carry over from the other mode.
+        self.configure(bg=bg)
+        style.theme_use("clam")
+        style.configure(".",                  background=bg, foreground=fg, fieldbackground=ebg)
+        style.configure("TFrame",             background=bg)
+        style.configure("TLabel",             background=bg, foreground=fg)
+        style.configure("TLabelframe",        background=bg, foreground=fg)
+        style.configure("TLabelframe.Label",  background=bg, foreground=fg)
+        style.configure("TNotebook",          background=bg)
+        style.configure("TNotebook.Tab",      background=bg, foreground=fg)
+        style.map("TNotebook.Tab",            background=[("selected", selbg)],
+                                              foreground=[("selected", "#ffffff")])
+
+        # Hover states: clam's built-ins flash white without this.
+        style.map("TLabel",       background=[("active", bg)])
+        style.map("TCheckbutton", background=[("active", bg)])
+
+        style.configure("TEntry",             fieldbackground=ebg, foreground=fg, insertcolor=fg)
+
+        # Comboboxes: the readonly *state* ignores the plain configure,
+        # causing the white-field bug in dark mode, so map it explicitly.
+        style.configure("TCombobox",          fieldbackground=ebg, foreground=fg,
+                                             selectbackground=selbg, selectforeground=fg)
+        style.map("TCombobox",
+                  fieldbackground=[("readonly", ebg)],
+                  foreground=[("readonly", fg)],
+                  selectbackground=[("readonly", selbg)],
+                  selectforeground=[("readonly", fg)])
+
+        # The dropdown list is a classic Tk listbox — ttk styles don't
+        # reach it, so style it through the option database.
+        self.option_add("*TCombobox*Listbox.background", ebg)
+        self.option_add("*TCombobox*Listbox.foreground", fg)
+        self.option_add("*TCombobox*Listbox.selectBackground", selbg)
+        self.option_add("*TCombobox*Listbox.selectForeground", fg)
+
+        style.configure("TButton",            background=btnbg, foreground=fg)
+        style.map("TButton",                  background=[("active", btnbg_active)])
+        style.configure("TCheckbutton",       background=bg, foreground=fg)
+        style.configure("TScrollbar",         background=bg, troughcolor=trough)
+        style.configure(
+            "Shortcut.TLabel",
+            background=bg,
+            foreground=fg,
+            font=("", self._scaled(9), "bold"),
+        )
 
     def _toggle_dark_mode(self):
         self._dark_mode = not self._dark_mode
@@ -495,6 +592,10 @@ class XFreeRDPApp(tk.Tk):
         ttk.Button(bar, text="💾 Save",   command=self._save_profile, width=9).pack(side=tk.LEFT, padx=2)
         ttk.Button(bar, text="📂 Load",   command=self._load_profile, width=9).pack(side=tk.LEFT, padx=2)
         ttk.Button(bar, text="🗑 Delete", command=self._delete_profile, width=9).pack(side=tk.LEFT, padx=2)
+        self._lock_btn = ttk.Button(bar, text="🔓 Unlock vault", width=16,
+                                    command=self._toggle_lock)
+        self._lock_btn.pack(side=tk.LEFT, padx=(10, 0))
+        Tooltip(self._lock_btn, "Lock or unlock the encrypted profile vault.\nLocked = profiles stay encrypted on disk and in memory.")
 
     # ── Connection tab ─────────────────────────────────────────────────────
     def _build_connection_tab(self):
@@ -828,7 +929,7 @@ class XFreeRDPApp(tk.Tk):
         cert_grid.pack(fill=tk.X)
 
         ttk.Label(cert_grid, text="Mode  (/cert:):").grid(row=0, column=0, sticky=tk.W, pady=4, padx=(0, 10))
-        self.cert_var = tk.StringVar(value="ignore")
+        self.cert_var = tk.StringVar(value="tofu")
         cert_cb = ttk.Combobox(
             cert_grid, textvariable=self.cert_var,
             values=["ignore", "tofu", "deny"], width=16,
@@ -956,7 +1057,7 @@ class XFreeRDPApp(tk.Tk):
 
     def _apply_initial_preview_state(self):
         """Called after bottom bar is built so before= reference is valid."""
-        if not self._load_settings().get("preview_visible", False):
+        if not self.settings.get("preview_visible", False):
             self._preview_lf.pack_forget()
             self._preview_visible = False
             self._preview_btn.config(text="👁️  Show preview")
@@ -971,7 +1072,7 @@ class XFreeRDPApp(tk.Tk):
             self._preview_lf.pack(fill=tk.X, pady=(8, 0), before=self._bottom_bar)
             self._preview_btn.config(text="👁️  Hide preview")
         self._preview_visible = not self._preview_visible
-        self._save_settings()
+        self.settings.set("preview_visible", self._preview_visible)
 
     # ── Bottom buttons ─────────────────────────────────────────────────────
     def _build_bottom_buttons(self, parent: ttk.Frame) -> None:
@@ -979,7 +1080,7 @@ class XFreeRDPApp(tk.Tk):
         self._bottom_bar.pack(fill=tk.X, pady=(8, 0))
 
         # Right side
-        ttk.Button(self._bottom_bar, text="⛔ Quit", command=self.quit).pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(self._bottom_bar, text="⛔ Quit", command=self._real_quit).pack(side=tk.RIGHT, padx=(6, 0))
         ttk.Button(
             self._bottom_bar,
             text="🔗 Connect",
@@ -1136,7 +1237,13 @@ class XFreeRDPApp(tk.Tk):
             cmd.append("/usb:id")
 
         for i in range(self.drives_listbox.size()):
-            cmd.append(f"/drive:{self.drives_listbox.get(i)}")  # type: ignore[misc]
+            spec = self.drives_listbox.get(i)  # type: ignore[misc]
+            name, _, path = spec.partition(",")
+            # Shell-style expansion: the GUI passes argv directly to
+            # xfreerdp (no shell), so $VAR and ~ would otherwise stay
+            # literal and the drive would never mount.
+            path = os.path.expanduser(os.path.expandvars(path))
+            cmd.append(f"/drive:{name},{path}")
 
         app = self.app_var.get().strip()
         if app:
@@ -1162,7 +1269,7 @@ class XFreeRDPApp(tk.Tk):
         return cmd
 
     def _refresh_command_preview(self, *_args: object) -> None:
-        cmd_str = " ".join(self._build_command())
+        cmd_str = mask_argv(self._build_command())
         self.cmd_text.config(state=tk.NORMAL)
         self.cmd_text.delete("1.0", tk.END)
         self.cmd_text.insert("1.0", cmd_str)
@@ -1170,23 +1277,170 @@ class XFreeRDPApp(tk.Tk):
 
     def _copy_command(self):
         self.clipboard_clear()
-        self.clipboard_append(" ".join(self._build_command()))
+        self.clipboard_append(mask_argv(self._build_command()))
         self._copy_btn.config(text="✅ Copied!")
         self.after(2000, lambda: self._copy_btn.config(text="📋 Copy to clipboard"))
         self._set_status("Command copied to clipboard.")
+
+    def _monitor_child(self, proc: subprocess.Popen, deadline_ms: float,
+                       server: str) -> None:
+        if proc.poll() is not None:
+            self._report_connection_failure(proc, server)
+            return
+        if self._uptime_ms() > deadline_ms:
+            # Survived the grace period — handshake succeeded. Drop the
+            # captured output: it served its purpose and there's nothing
+            # to report anymore.
+            try:
+                self._child_log.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self._set_status(f"Connected to {server}.")
+            return
+        self.after(500, lambda: self._monitor_child(proc, deadline_ms, server))
+
+    def _uptime_ms(self) -> float:
+        return (time.monotonic() - self._launch_t0) * 1000
+
+    def _report_connection_failure(self, proc: subprocess.Popen, server: str) -> None:
+        code = proc.returncode
+        try:
+            log_tail = self._child_log.read_text(errors="replace")[-2000:]
+        except Exception:
+            log_tail = ""
+        self._set_status(f"Connection to {server} failed (exit code {code}).")
+
+        hint = self._humanize_error(log_tail)
+        summary = (f"Connection to {server} failed."
+                   + (f"\n{hint}" if hint else "")
+                   + f"\nExit code: {code}")
+        body = (summary + "\n\nLast output from xfreerdp:\n"
+                + ("(no output captured)" if not log_tail else log_tail))
+        win = self._failure_popup(summary, body)
+        if win is None:  # tray mode path
+            return
+
+    def _failure_popup(self, summary: str, body: str) -> "tk.Toplevel | None":
+        """Popup with a copyable Details section. Works over a withdrawn
+        root (tray mode) as well."""
+        dlg = tk.Toplevel(self)
+        dlg.title("Connection failed")
+        dlg.resizable(False, False)
+        if self.winfo_viewable():
+            dlg.transient(self)
+        dlg.grab_set()
+
+        pad = ttk.Frame(dlg, padding=14)
+        pad.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(pad, text=summary, wraplength=380,
+                  foreground="#c0392b").pack(anchor=tk.W)
+
+        txt = tk.Text(pad, height=min(14, body.count("\n")), width=64,
+                      wrap=tk.WORD, state=tk.DISABLED, relief=tk.FLAT,
+                      background=dlg.cget("background"),
+                      font=getattr(self, "_app_mono_font", tkfont.nametofont("TkFixedFont")))
+        txt.pack(fill=tk.BOTH, expand=True, pady=(8, 4))
+        txt.config(state=tk.NORMAL)
+        txt.insert("1.0", body)
+        txt.config(state=tk.DISABLED)   # selection + Ctrl+C still work
+
+        def _dismiss() -> None:
+            dlg.destroy()
+            try:
+                self._child_log.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        btn_row = ttk.Frame(pad)
+        btn_row.pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(btn_row, text="📋 Copy details",
+                   command=lambda: (self.clipboard_clear(),
+                                    self.clipboard_append(body))).pack(side=tk.LEFT)
+        ttk.Button(btn_row, text="Close", command=_dismiss).pack(side=tk.RIGHT)
+
+        dlg.bind("<Return>", lambda _: _dismiss())
+        dlg.bind("<Escape>", lambda _: _dismiss())
+
+        # Center on parent if visible, else on screen.
+        dlg.update_idletasks()
+        dw, dh = dlg.winfo_reqwidth(), dlg.winfo_reqheight()
+        if self.winfo_viewable():
+            px, py = self.winfo_rootx(), self.winfo_rooty()
+            pw, ph = self.winfo_width(), self.winfo_height()
+        else:
+            px, py = 0, 0
+            pw, ph = self.winfo_screenwidth(), self.winfo_screenheight()
+        dlg.geometry(f"+{px + max(0, (pw - dw) // 2)}+{py + max(0, (ph - dh) // 2)}")
+        return dlg
 
     def _connect(self):
         if not self.server_var.get().strip():
             messagebox.showerror("Validation Error", "A server address is required before connecting.")
             self._set_status("Error: server address required.")
             return
+        if self.cert_var.get().strip() == "ignore":
+            if not messagebox.askyesno(
+                "Certificate validation disabled",
+                "Certificates are set to IGNORE — anyone intercepting the network\n"
+                "could read your credentials and session.\n\nContinue anyway?",
+            ):
+                return
+        port_txt = self.port_var.get().strip()
+        if port_txt and validate_port(port_txt) is None:
+            messagebox.showerror("Validation Error",
+                "Port must be an integer between 1 and 65535.")
+            return
+        if not self.fullscreen_var.get():
+            for name, var, lo, hi in (("Width", self.width_var, 200, 8192),
+                                      ("Height", self.height_var, 200, 8192)):
+                val = validate_int(var.get(), lo, hi)
+                if val is None:
+                    messagebox.showerror("Validation Error",
+                        f"{name} must be a number between {lo} and {hi}.")
+                    return
+        if self.autoreconnect_var.get() and validate_int(
+                self.reconnect_retries_var.get(), 1, 999) is None:
+            messagebox.showerror("Validation Error",
+                "Max retries must be a number between 1 and 999.")
+            return
+
+        # ── Password prompt ──────────────────────────────────────────────
+        # Standalone dialog: works from the tray without opening the GUI.
+        self._clear_pw_after_launch = False
+        if not self.pass_var.get():
+            who = self.user_var.get().strip() or self.server_var.get().strip()
+            dlg = PasswordDialog(self, who)
+            self.wait_window(dlg)
+            if dlg.result is None:          # Cancel pressed
+                self._set_status("Connect cancelled.")
+                return
+            if dlg.result:
+                self.pass_var.set(dlg.result)
+                self._clear_pw_after_launch = True
+
         cmd = self._build_command()
         server = self.server_var.get().strip()
         self._set_status(f"Launching connection to {server} …")
+        # ── Launch with output capture ───────────────────────────────────
+        # stderr/stdout go to a temp file so a failed handshake can be
+        # shown in a popup with the actual error lines (details view).
+        log_fh = open(self._child_log, "wb")
+        self._launch_t0 = time.monotonic()
         try:
-            subprocess.Popen(cmd)  # noqa: S603 – user-controlled binary path
-            self._set_status(f"Connected to {server}.")
+            proc = subprocess.Popen(  # noqa: S603 – user-controlled binary path
+                cmd, stdout=log_fh, stderr=subprocess.STDOUT)
+            log_fh.close()
+            if self._clear_pw_after_launch:
+                # Clear the field so the password isn't left sitting in the
+                # form after the hand-off to xfreerdp.
+                self.pass_var.set("")
+                self._clear_pw_after_launch = False
+            self._set_status(f"Connecting to {server} …")
+            # Poll: if it dies within the grace window, the handshake
+            # failed → show a popup with the captured output.
+            self.after(500, lambda: self._monitor_child(proc, 10_000, server))
         except FileNotFoundError:
+            log_fh.close()
             self._set_status("Error: xfreerdp binary not found.")
             messagebox.showerror(
                 "Binary Not Found",
@@ -1194,8 +1448,10 @@ class XFreeRDPApp(tk.Tk):
                 "Install FreeRDP or set the correct path in the Advanced tab.",
             )
         except Exception as exc:
+            log_fh.close()
             self._set_status(f"Error: {exc}")
             messagebox.showerror("Launch Failed", f"Could not launch xfreerdp:\n{exc}")
+
 
     # ── Profile management ─────────────────────────────────────────────────
     def _refresh_profile_list(self):
@@ -1271,7 +1527,7 @@ class XFreeRDPApp(tk.Tk):
         for d in cfg.get("drives", []):
             self.drives_listbox.insert(tk.END, d)
         self.app_var.set(cfg.get("app", ""))
-        self.cert_var.set(cfg.get("cert", "ignore"))
+        self.cert_var.set(cfg.get("cert", "tofu"))
         self.sec_var.set(cfg.get("sec", ""))
         self.noauth_var.set(cfg.get("noauth", False))
         self.admin_var.set(cfg.get("admin", False))
@@ -1284,13 +1540,33 @@ class XFreeRDPApp(tk.Tk):
         if not name:
             messagebox.showerror("Validation Error", "Enter a profile name first.")
             return
+        previous = self.profiles.get(name)
         self.profiles[name] = self._get_current_config()
-        self._write_profiles()
+        if not self._write_profiles():
+            # Roll back so the in-memory list matches the on-disk vault.
+            if previous is None:
+                self.profiles.pop(name, None)
+            else:
+                self.profiles[name] = previous
+            self._refresh_profile_list()
+            self._tray_refresh_menu()
+            self._set_status("Error: profile not saved — vault is locked.")
+            messagebox.showwarning(
+                "Not Saved",
+                "The profile was NOT saved because the vault is locked and unlocking was cancelled."
+            )
+            return
         self._refresh_profile_list()
+        self._tray_refresh_menu()
         self._set_status(f"Profile «{name}» saved.")
         messagebox.showinfo("Profile Saved", f"Profile «{name}» has been saved.")
 
     def _load_profile(self):
+        if not self._vault.unlocked and not self._prompt_unlock():
+            return
+        self.profiles = dict(self._vault.profiles)
+        self._refresh_profile_list()
+
         name = self.profile_var.get().strip()
         if name not in self.profiles:
             messagebox.showerror("Profile Not Found", f"No profile named «{name}».")
@@ -1299,57 +1575,236 @@ class XFreeRDPApp(tk.Tk):
         self._set_status(f"Profile «{name}» loaded.")
 
     def _on_profile_selected(self, _event: tk.Event[Any] | None = None) -> None:
+        if not self._vault.unlocked and not self._prompt_unlock():
+            return
+        self.profiles = dict(self._vault.profiles)
+        self._refresh_profile_list()
+
         name = self.profile_var.get().strip()
         if name in self.profiles:
             self._apply_config(self.profiles[name])
             self._set_status(f"Profile «{name}» loaded.")
 
     def _delete_profile(self):
+        if not self._vault.unlocked and not self._prompt_unlock():
+            return
+        self.profiles = dict(self._vault.profiles)
+        self._refresh_profile_list()
+
         name = self.profile_var.get().strip()
         if name not in self.profiles:
             messagebox.showerror("Profile Not Found", f"No profile named «{name}».")
             return
-        if messagebox.askyesno("Confirm Delete", f"Permanently delete profile «{name}»?"):
-            del self.profiles[name]
-            self._write_profiles()
-            self._refresh_profile_list()
-            self.profile_var.set("")
-            self._set_status(f"Profile «{name}» deleted.")
+        if not messagebox.askyesno("Confirm Delete", f"Permanently delete profile «{name}»?"):
+            return
+        removed = self.profiles.pop(name)
+        if not self._write_profiles():
+            self.profiles[name] = removed  # restore: disk still has it
+            self._set_status("Error: profile not deleted — vault is locked.")
+            messagebox.showwarning(
+                "Not Deleted",
+                "The profile was NOT deleted because the vault is locked and unlocking was cancelled."
+            )
+            return
+        self._refresh_profile_list()
+        self._tray_refresh_menu()
+        self.profile_var.set("")
+        self._set_status(f"Profile «{name}» deleted.")
 
     def _load_profiles(self) -> dict[str, Any]:
-        if PROFILES_FILE.exists():
-            try:
-                with open(PROFILES_FILE) as fh:
-                    return json.load(fh)
-            except Exception:
-                pass
+        # Profiles now live in the vault; this is only kept for call-site
+        # compatibility. Actual load happens in _prompt_unlock.
         return {}
 
-    def _write_profiles(self):
-        with open(PROFILES_FILE, "w") as fh:
-            json.dump(self.profiles, fh, indent=2)
+    def _write_profiles(self) -> bool:
+        if not self._vault.unlocked:
+            if not self._prompt_unlock():
+                return False
+        self._vault.profiles.clear()
+        self._vault.profiles.update(self.profiles)
+        return self._vault.save() or False
 
     def _load_theme_setting(self) -> bool:
-        return self._load_settings().get("dark_mode", _detect_system_dark())
+        return self.settings.get("dark_mode", _detect_system_dark())
 
     def _save_theme_setting(self):
-        self._save_settings()
+        self.settings.set("dark_mode", self._dark_mode)
 
-    def _load_settings(self) -> dict[str, Any]:
-        if SETTINGS_FILE.exists():
+    # ── System tray ────────────────────────────────────────────────────
+    def _check_tray_support(self) -> str | None:
+        """Return a fatal warning message if the tray cannot work here."""
+        de = (os.environ.get("XDG_CURRENT_DESKTOP") or "").lower()
+        if "gnome" not in de:
+            return None  # KDE/XFCE/MATE/Cinnamon/…: nothing needed
+
+        try:
+            result = subprocess.run(
+                ["gnome-extensions", "list", "--enabled"],
+                capture_output=True, text=True, timeout=3,
+            )
+        except Exception:
+            return None  # cannot verify — be permissive rather than blocking
+
+        if result.returncode != 0:
+            return None  # older GNOME or odd session — assume best case
+
+        if "appindicator" in result.stdout.lower():
+            return None  # extension present, tray will work
+
+        return (
+            "GNOME requires the AppIndicator extension to show a tray icon.\n\n"
+            "Debian / Ubuntu:\n"
+            "    sudo apt install gnome-shell-extension-appindicator\n"
+            "Fedora:\n"
+            "    sudo dnf install gnome-shell-extension-appindicator\n\n"
+            "Then log out and back in, and start XFreeRDP GUI again.\n\n"
+            "The application will now exit."
+        )
+
+    def _setup_tray(self):
+        self._tray = TrayIcon(
+            "xfreerdp-gui",
+            _resource_path("icon.png"),
+            "XFreeRDP GUI",
+            marshal=self._tray_enqueue,
+        )
+        self._tray.update_menu(*self._tray_menu_spec())
+
+    def _tray_menu_spec(self) -> tuple[list[dict], dict]:
+        spec: list[dict] = []
+        cmds: dict = {"unlock": self._tray_unlock,
+                      "open": self.deiconify,
+                      "quit": self._real_quit,
+                      "lock": self._toggle_lock}
+        if self._vault.unlocked:
+            if self.profiles:
+                for name in sorted(self.profiles):
+                    spec.append({"label": name, "cmd": f"profile:{name}"})
+                    cmds[f"profile:{name}"] = (lambda n=name: self._tray_connect(n))
+            else:
+                spec.append({"label": "(no profiles saved)", "enabled": False})
+            spec.append({"sep": True})
+            spec.append({"label": "Open Main Window", "cmd": "open"})
+            spec.append({"label": "Lock vault", "cmd": "lock"})
+            spec.append({"label": "Quit", "cmd": "quit"})
+        else:
+            spec.append({"label": "Unlock vault…", "cmd": "unlock"})
+            spec.append({"sep": True})
+            spec.append({"label": "Open Main Window", "cmd": "open"})
+            spec.append({"label": "Quit", "cmd": "quit"})
+        return spec, cmds
+
+    def _tray_refresh_menu(self):
+        if self._tray is not None:
+            self._tray.update_menu(*self._tray_menu_spec())
+
+    def _tray_enqueue(self, fn):
+        """Marshal a callback from pystray's thread onto the Tk mainloop."""
+        self._tray_queue.put(fn)
+
+    def _poll_tray_queue(self):
+        try:
+            while True:
+                self._tray_queue.get_nowait()()
+        except queue.Empty:
+            pass
+        self.after(100, self._poll_tray_queue)
+
+    def _tray_unlock(self):
+        self._prompt_unlock()
+        self._tray_refresh_menu()
+
+    def _tray_connect(self, name: str):
+        if not self._vault.unlocked or name not in self.profiles:
+            return
+        self._apply_config(self.profiles[name])
+        self._connect()
+
+    def _on_close(self):
+        if self._tray is not None:
+            self.withdraw()  # close-to-tray instead of exit
+        else:
+            self._real_quit()
+
+    def _real_quit(self):
+        if self._tray is not None:
             try:
-                with open(SETTINGS_FILE) as fh:
-                    return json.load(fh)
+                self._tray.stop()
             except Exception:
                 pass
-        return {}
+        self.destroy()
 
-    def _save_settings(self):
-        data = self._load_settings()
-        data["dark_mode"] = self._dark_mode
-        data["preview_visible"] = self._preview_visible if hasattr(self, "_preview_visible") else False
-        with open(SETTINGS_FILE, "w") as fh:
-            json.dump(data, fh)
+    def _centered_popup(self, title: str, body: str, width_chars: int = 52) -> None:
+        """Modal info dialog with copyable text, centered on the main window."""
+        dlg = tk.Toplevel(self)
+        dlg.title(title)
+        dlg.transient(self)
+        dlg.resizable(False, False)
+        dlg.grab_set()
+
+        pad = ttk.Frame(dlg, padding=14)
+        pad.pack(fill=tk.BOTH, expand=True)
+
+        # Read-only Text widget: selection + Ctrl+C still work in a disabled
+        # Tk Text, unlike messagebox labels.
+        txt = tk.Text(
+            pad, height=min(20, body.count("\n") + 2), width=width_chars,
+            wrap=tk.WORD, state=tk.DISABLED, relief=tk.FLAT,
+            background=dlg.cget("background"),
+            font=self._app_mono_font if hasattr(self, "_app_mono_font") else "",
+        )
+        txt.tag_configure("hint", foreground="#444444")
+        txt.pack(fill=tk.BOTH, expand=True)
+        txt.config(state=tk.NORMAL)
+        txt.insert("1.0", body)
+        txt.config(state=tk.DISABLED)
+
+        btn_row = ttk.Frame(pad)
+        btn_row.pack(fill=tk.X, pady=(10, 0))
+        ttk.Button(btn_row, text="📋 Copy all", command=lambda: (
+            self.clipboard_clear(),
+            self.clipboard_append(body),
+        )).pack(side=tk.LEFT)
+        ttk.Button(btn_row, text="Close", command=dlg.destroy).pack(side=tk.RIGHT)
+
+        dlg.bind("<Return>", lambda _: dlg.destroy())
+        dlg.bind("<Escape>", lambda _: dlg.destroy())
+
+        # Position after the WM has mapped the dialog, so our geometry
+        # wins over the WM's transient-placement heuristics.
+        dlg.wait_visibility()
+        dw, dh = dlg.winfo_reqwidth(), dlg.winfo_reqheight()
+        if self.winfo_viewable():
+            px, py = self.winfo_rootx(), self.winfo_rooty()
+            pw, ph = self.winfo_width(), self.winfo_height()
+        else:
+            pw, ph = self.winfo_screenwidth(), self.winfo_screenheight()
+            px, py = 0, 0
+        x = px + max(0, (pw - dw) // 2)
+        y = py + max(0, (ph - dh) // 2)
+        dlg.geometry(f"+{x}+{y}")
+
+        self.wait_window(dlg)
+
+    def _startup_with_tray_warning(self):
+        """Show the no-tray warning once the main window is mapped, then
+        continue startup. Waiting for mapping avoids KWin repositioning
+        the transient dialog when the parent window appears."""
+        if not self.winfo_viewable():
+            self.after(50, self._startup_with_tray_warning)
+            return
+        self._centered_popup(
+            "Running without tray",
+            "System tray support is unavailable, so the app will run as a normal window.\n\n"
+            "To enable the tray, install:\n"
+            "    Debian/Ubuntu:  sudo apt install gir1.2-ayatanaappindicator3-0.1 gir1.2-gtk-3.0\n"
+            "    Fedora:         sudo dnf install libayatana-appindicator-gtk3 gtk3\n"
+            "    Arch:           sudo pacman -S libayatana-appindicator\n"
+            + ("\nGNOME additionally needs the AppIndicator shell extension."
+               if "gnome" in (os.environ.get("XDG_CURRENT_DESKTOP") or "").lower()
+               else ""),
+        )
+        self._startup_vault_flow()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
