@@ -15,7 +15,7 @@ fi
 
 if ! command -v appimagetool >/dev/null 2>&1; then
     echo "ERROR: appimagetool not found in PATH."
-    echo "Download it from: https://github.com/AppImage/AppImageKit/releases"
+    echo "Download it from: https://github.com/AppImage/appimagetool/releases/tag/continuous"
     exit 1
 fi
 
@@ -25,6 +25,8 @@ echo "[1/4] Building standalone binary with PyInstaller..."
     --clean \
     --onefile \
     --windowed \
+    --add-data "icon.png:." \
+    --add-data "icon.svg:." \
     --name xfreerdp-gui \
     "$ROOT_DIR/main.py"
 
@@ -37,11 +39,11 @@ mkdir -p \
 cp "$ROOT_DIR/dist/xfreerdp-gui" "$APPDIR/usr/bin/xfreerdp-gui"
 cp "$ROOT_DIR/packaging/appimage/AppRun" "$APPDIR/AppRun"
 cp "$ROOT_DIR/packaging/appimage/xfreerdp-gui.desktop" "$APPDIR/xfreerdp-gui.desktop"
-cp "$ROOT_DIR/icon.svg" "$APPDIR/xfreerdp-gui.svg"
+cp "$ROOT_DIR/icon.png" "$APPDIR/xfreerdp-gui.png"
 
 chmod +x "$APPDIR/AppRun"
 chmod +x "$APPDIR/usr/bin/xfreerdp-gui"
-ln -sf "xfreerdp-gui.svg" "$APPDIR/.DirIcon"
+ln -sf "xfreerdp-gui.png" "$APPDIR/.DirIcon"
 
 echo "[3/4] Creating AppImage..."
 appimagetool "$APPDIR" "$APPIMAGE_OUT"
