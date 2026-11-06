@@ -703,7 +703,7 @@ class XFreeRDPApp(tk.Tk):
     # ── Display tab ────────────────────────────────────────────────────────
     def _build_display_tab(self):
         frame = ttk.Frame(self.notebook)
-        self.notebook.add(frame, text="🖥️  Display")
+        self.notebook.add(frame, text="🖥  Display")
         outer = ttk.Frame(frame, padding=(12, 10))
         outer.pack(fill=tk.BOTH, expand=True)
 
@@ -979,7 +979,7 @@ class XFreeRDPApp(tk.Tk):
     # ── Advanced tab ───────────────────────────────────────────────────────
     def _build_advanced_tab(self):
         frame = ttk.Frame(self.notebook)
-        self.notebook.add(frame, text="⚙️  Advanced")
+        self.notebook.add(frame, text="⚙  Advanced")
         outer = ttk.Frame(frame, padding=(12, 10))
         outer.pack(fill=tk.BOTH, expand=True)
 
@@ -1060,17 +1060,17 @@ class XFreeRDPApp(tk.Tk):
         if not self.settings.get("preview_visible", False):
             self._preview_lf.pack_forget()
             self._preview_visible = False
-            self._preview_btn.config(text="👁️  Show preview")
+            self._preview_btn.config(text="👁  Show preview")
         else:
-            self._preview_btn.config(text="👁️  Hide preview")
+            self._preview_btn.config(text="👁  Hide preview")
 
     def _toggle_preview(self):
         if self._preview_visible:
             self._preview_lf.pack_forget()
-            self._preview_btn.config(text="👁️  Show preview")
+            self._preview_btn.config(text="👁  Show preview")
         else:
             self._preview_lf.pack(fill=tk.X, pady=(8, 0), before=self._bottom_bar)
-            self._preview_btn.config(text="👁️  Hide preview")
+            self._preview_btn.config(text="👁  Hide preview")
         self._preview_visible = not self._preview_visible
         self.settings.set("preview_visible", self._preview_visible)
 
@@ -1097,7 +1097,7 @@ class XFreeRDPApp(tk.Tk):
         Tooltip(self._theme_btn, "Toggle light / dark colour scheme.")
 
         self._preview_btn = ttk.Button(
-            self._bottom_bar, text="👁️  Show preview", command=self._toggle_preview
+            self._bottom_bar, text="👁  Show preview", command=self._toggle_preview
         )
         self._preview_btn.pack(side=tk.LEFT, padx=(6, 0))
         Tooltip(self._preview_btn, "Show or hide the command preview panel.")
@@ -1404,18 +1404,29 @@ class XFreeRDPApp(tk.Tk):
                 "Max retries must be a number between 1 and 999.")
             return
 
-        # ── Password prompt ──────────────────────────────────────────────
-        # Standalone dialog: works from the tray without opening the GUI.
+        # ── Credential prompt ────────────────────────────────────────────
+        # Ask only for what's missing: password, username, or both.
         self._clear_pw_after_launch = False
-        if not self.pass_var.get():
-            who = self.user_var.get().strip() or self.server_var.get().strip()
-            dlg = PasswordDialog(self, who)
+        has_user = bool(self.user_var.get().strip())
+        has_pass = bool(self.pass_var.get())
+        if not (has_user and has_pass):
+            who = (self.user_var.get().strip()
+                   or self.server_var.get().strip())
+            if not has_user and not has_pass:
+                mode = "both"
+            elif not has_user:
+                mode = "user"
+            else:
+                mode = "password"
+            dlg = PasswordDialog(self, who, mode=mode)
             self.wait_window(dlg)
             if dlg.result is None:          # Cancel pressed
                 self._set_status("Connect cancelled.")
                 return
-            if dlg.result:
-                self.pass_var.set(dlg.result)
+            if "username" in dlg.result and dlg.result["username"]:
+                self.user_var.set(dlg.result["username"])
+            if "password" in dlg.result and dlg.result["password"]:
+                self.pass_var.set(dlg.result["password"])
                 self._clear_pw_after_launch = True
 
         cmd = self._build_command()

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 dialogs.py — Dialog windows for XFreeRDP GUI: tooltips, drive redirection,
-and the vault unlock popup with a configurable in-memory key lifetime.
+credential prompts, and the vault unlock popup with a configurable
+in-memory key lifetime.
 """
 from __future__ import annotations
 
@@ -21,21 +22,75 @@ VAULT_DURATIONS: list[tuple[str, int]] = [
 ]
 
 
+def modal_grab(win: tk.Toplevel) -> None:
+    """Set a modal grab safely: only once the window is actually viewable,
+    never raising if that is momentarily impossible (e.g. parent races).
+    Setting a grab before mapping raises TclError and, worse, can leave
+    Tk's grab bookkeeping stranded — which is exactly how the
+    keyboard-input freeze happened."""
+    try:
+        win.wait_visibility()
+        win.grab_set()
+    except tk.TclError:
+        pass
+
+
+def modal_release(win: tk.Toplevel) -> None:
+    """Release the modal grab before destroying a dialog. Tk normally
+    cleans up when the grabbing window dies, but 'normally' fails when
+    dialogs chain or destroy from unusual paths; always release first."""
+    try:
+        win.grab_release()
+    except tk.TclError:
+        pass
+
+
 class Tooltip:
-    """Simple hover tooltip for any tkinter widget."""
+    """Hover tooltip with a dwell delay.
+
+    The original version showed immediately on <Enter> and destroyed on
+    <Leave> — meaning rapid pointer travel across the form churned tooltip
+    creation/destruction directly over adjacent fields, and a click
+    landing during that churn stranded keyboard focus (all entries went
+    input-dead until restart; mouse-driven widgets kept working).
+
+    Changes that fix it:
+    - 1000 ms dwell delay: crossings spawn nothing, only resting does
+    - hides on any ButtonPress: never alive at click time
+    - larger offset: less overlap with the widget below
+    - destroying a tip swallows TclError (double-destroy is harmless)
+    """
+
+    DELAY_MS = 1000
 
     def __init__(self, widget: tk.Widget, text: str):
         self._widget = widget
         self._text = text
         self._tip_window: tk.Toplevel | None = None
-        widget.bind("<Enter>", self._show)
+        self._after_id: str | None = None
+        widget.bind("<Enter>", self._schedule)
         widget.bind("<Leave>", self._hide)
+        widget.bind("<ButtonPress>", self._hide)   # die before clicks land
 
-    def _show(self, _event: tk.Event[Any] | None = None) -> None:
-        if self._tip_window or not self._text:
+    def _schedule(self, _event: tk.Event[Any] | None = None) -> None:
+        self._cancel()
+        self._after_id = self._widget.after(self.DELAY_MS, self._show)
+
+    def _cancel(self) -> None:
+        if self._after_id is not None:
+            try:
+                self._widget.after_cancel(self._after_id)
+            except tk.TclError:
+                pass
+            self._after_id = None
+
+    def _show(self) -> None:
+        self._after_id = None
+        self._destroy_tip()
+        if not self._text or not self._widget.winfo_exists():
             return
-        x = self._widget.winfo_rootx() + 20
-        y = self._widget.winfo_rooty() + self._widget.winfo_height() + 4
+        x = self._widget.winfo_rootx() + 24
+        y = self._widget.winfo_rooty() + self._widget.winfo_height() + 12
         self._tip_window = tw = tk.Toplevel(self._widget)
         tw.wm_overrideredirect(True)
         tw.wm_geometry(f"+{x}+{y}")
@@ -54,8 +109,15 @@ class Tooltip:
         ).pack()
 
     def _hide(self, _event: tk.Event[Any] | None = None) -> None:
-        if self._tip_window:
-            self._tip_window.destroy()
+        self._cancel()
+        self._destroy_tip()
+
+    def _destroy_tip(self) -> None:
+        if self._tip_window is not None:
+            try:
+                self._tip_window.destroy()
+            except tk.TclError:
+                pass        # already gone — never propagate here
             self._tip_window = None
 
 
@@ -69,7 +131,6 @@ class DriveDialog(tk.Toplevel):
         self.resizable(False, False)
         self.result: str | None = None
         self.transient(parent)
-        self.grab_set()
 
         f = ttk.Frame(self, padding=15)
         f.pack(fill=tk.BOTH, expand=True)
@@ -102,17 +163,25 @@ class DriveDialog(tk.Toplevel):
         btn = ttk.Frame(f)
         btn.grid(row=2, column=0, columnspan=2, pady=(12, 0))
         ttk.Button(btn, text="OK", command=self._ok).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn, text="Cancel", command=self.destroy).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn, text="Cancel", command=self._cancel).pack(side=tk.LEFT, padx=5)
 
         f.columnconfigure(1, weight=1)
         self.bind("<Return>", lambda _: self._ok())
-        self.bind("<Escape>", lambda _: self.destroy())
+        self.bind("<Escape>", lambda _: self._cancel())
+        self.update_idletasks()
+        modal_grab(self)
+
+    def _cancel(self) -> None:
+        modal_release(self)
+        self.result = None
+        self.destroy()
 
     def _ok(self) -> None:
         name = self.name_var.get().strip()
         path = self.path_var.get().strip()
         if name and path:
             self.result = f"{name},{path}"
+        modal_release(self)
         self.destroy()
 
 
@@ -134,7 +203,6 @@ class UnlockDialog(tk.Toplevel):
         # unmapped makes some WMs misplace or bury the dialog.
         if parent.winfo_viewable():
             self.transient(parent)
-        self.grab_set()
 
         pad = ttk.Frame(self, padding=18)
         pad.pack(fill=tk.BOTH, expand=True)
@@ -185,10 +253,10 @@ class UnlockDialog(tk.Toplevel):
         btn.pack(fill=tk.X, pady=(14, 0))
         ok_btn = ttk.Button(btn, text="Unlock", command=self._ok)
         ok_btn.pack(side=tk.RIGHT, padx=(6, 0))
-        ttk.Button(btn, text="Cancel", command=self.destroy).pack(side=tk.RIGHT)
+        ttk.Button(btn, text="Cancel", command=self._cancel).pack(side=tk.RIGHT)
 
         self.bind("<Return>", lambda _: self._ok())
-        self.bind("<Escape>", lambda _: self.destroy())
+        self.bind("<Escape>", lambda _: self._cancel())
         # Center on screen (or on parent if visible).
         self.update_idletasks()
         dw, dh = self.winfo_reqwidth(), self.winfo_reqheight()
@@ -201,8 +269,8 @@ class UnlockDialog(tk.Toplevel):
         x = px + max(0, (pw - dw) // 2)
         y = py + max(0, (ph - dh) // 2)
         self.geometry(f"+{x}+{y}")
-        self.wait_visibility()
-        self.grab_set()
+        # Grab only after we are mapped and positioned.
+        modal_grab(self)
 
     def _resolve_ttl(self) -> int | None:
         custom = self.custom_var.get().strip()
@@ -218,6 +286,11 @@ class UnlockDialog(tk.Toplevel):
                 return secs
         return 900  # fallback: 15 minutes
 
+    def _cancel(self) -> None:
+        modal_release(self)
+        self.result = None
+        self.destroy()
+
     def _ok(self) -> None:
         passphrase = self.pass_entry.get()
         ttl = self._resolve_ttl()
@@ -227,38 +300,60 @@ class UnlockDialog(tk.Toplevel):
             # Invalid custom value: fall back to 15 minutes rather than blocking.
             ttl = 900
         self.result = (passphrase, ttl)
+        modal_release(self)
         self.destroy()
 
-class PasswordDialog(tk.Toplevel):
-    """Standalone password prompt. self.result is the password, or None
-    if the user cancelled. Works whether the parent window is visible
-    (windowed mode) or withdrawn (tray mode)."""
 
-    def __init__(self, parent: tk.Tk | tk.Toplevel, who: str):
+class PasswordDialog(tk.Toplevel):
+    """Credential prompt. Works whether the parent window is visible
+    (windowed mode) or withdrawn (tray mode).
+
+    mode: "both"     -> ask for username and password
+          "user"     -> ask for username only
+          "password" -> ask for password only
+
+    self.result is a dict {"username": str, "password": str} with the
+    fields that were asked for (absent keys were not requested), or
+    None if the user cancelled.
+    """
+
+    def __init__(self, parent: tk.Tk | tk.Toplevel, who: str,
+                 mode: str = "password"):
         super().__init__(parent)
-        self.title("Password")
+        self.title("Credentials" if mode == "both" else
+                   "Username" if mode == "user" else "Password")
         self.resizable(False, False)
-        self.result: str | None = None
+        self.result: dict[str, str] | None = None
+        self._mode = mode
 
         if parent.winfo_viewable():
             self.transient(parent)
-        self.grab_set()
 
         pad = ttk.Frame(self, padding=16)
         pad.pack(fill=tk.BOTH, expand=True)
 
-        ttk.Label(pad, text=f"Password for {who}:").pack(anchor=tk.W)
-        self.entry = ttk.Entry(pad, show="•", width=32)
-        self.entry.pack(fill=tk.X, pady=(6, 12))
-        self.entry.focus_set()
+        ttk.Label(pad, text=f"Credentials for {who}:").pack(anchor=tk.W)
+
+        self._entries: dict[str, ttk.Entry] = {}
+        if mode in ("both", "user"):
+            ttk.Label(pad, text="Username:").pack(anchor=tk.W, pady=(8, 0))
+            user_entry = ttk.Entry(pad, width=32)
+            user_entry.pack(fill=tk.X, pady=(2, 0))
+            self._entries["username"] = user_entry
+        if mode in ("both", "password"):
+            ttk.Label(pad, text="Password:").pack(anchor=tk.W, pady=(8, 0))
+            pw_entry = ttk.Entry(pad, show="•", width=32)
+            pw_entry.pack(fill=tk.X, pady=(2, 0))
+            self._entries["password"] = pw_entry
 
         btn = ttk.Frame(pad)
-        btn.pack(fill=tk.X)
-        ttk.Button(btn, text="Connect", command=self._ok).pack(side=tk.RIGHT, padx=(6, 0))
-        ttk.Button(btn, text="Cancel", command=self.destroy).pack(side=tk.RIGHT)
+        btn.pack(fill=tk.X, pady=(12, 0))
+        ttk.Button(btn, text="Connect", command=self._ok).pack(
+            side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(btn, text="Cancel", command=self._cancel).pack(side=tk.RIGHT)
 
         self.bind("<Return>", lambda _: self._ok())
-        self.bind("<Escape>", lambda _: self.destroy())
+        self.bind("<Escape>", lambda _: self._cancel())
 
         # Center on the parent if it is on screen, else on the screen.
         self.update_idletasks()
@@ -271,6 +366,18 @@ class PasswordDialog(tk.Toplevel):
             pw, ph = self.winfo_screenwidth(), self.winfo_screenheight()
         self.geometry(f"+{px + max(0, (pw - dw) // 2)}+{py + max(0, (ph - dh) // 2)}")
 
+        (self._entries.get("username") or
+         self._entries.get("password")).focus_set()
+        # Grab only after we are mapped and positioned.
+        modal_grab(self)
+
+    def _cancel(self) -> None:
+        modal_release(self)
+        self.result = None
+        self.destroy()
+
     def _ok(self) -> None:
-        self.result = self.entry.get()
+        self.result = {field: entry.get()
+                       for field, entry in self._entries.items()}
+        modal_release(self)
         self.destroy()
